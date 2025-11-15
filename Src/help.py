@@ -1,85 +1,274 @@
+from typing import Tuple, List
+
+import numpy as np
 import torch
-from transformers import GPT2LMHeadModel, GPT2TokenizerFast
+from datasets import Dataset
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm.auto import tqdm
 
-def compute_entropy(text, gpt2_model, tokenizer):
-    # GPT-2 tokenizer
-    inputs = tokenizer(text, return_tensors="pt")
+from model import (
+    TfidfLRDetector,
+    GPT2EntropyDetector,
+    GPT2PerplexityDetector,
+    RNNModel,
+    LSTMModel,
+)
+
+
+def split_tokenized_dataset(
+    dataset: Dataset,
+    test_size: float = 0.2,
+    seed: int = 42,
+) -> Tuple[Dataset, Dataset]:
+    """
+    Split a HuggingFace tokenized Dataset into train / test.
+    """
+    split = dataset.train_test_split(test_size=test_size, seed=seed)
+    return split["train"], split["test"]
+
+
+def _build_dataloader(ds: Dataset, batch_size: int, shuffle: bool) -> DataLoader:
+    """
+    Build a DataLoader from a HuggingFace Dataset, avoiding NumPy 2.0 copy=False issues
+    by converting directly to torch.Tensor.
+    """
+    input_ids = torch.tensor(ds["input_ids"], dtype=torch.long)
+    attention_mask = torch.tensor(ds["attention_mask"], dtype=torch.long)
+    labels = torch.tensor(ds["labels"], dtype=torch.long)
+    tensor_ds = TensorDataset(input_ids, attention_mask, labels)
+    return DataLoader(tensor_ds, batch_size=batch_size, shuffle=shuffle)
+
+
+def train_torch_model(
+    model: torch.nn.Module,
+    train_ds: Dataset,
+    batch_size: int,
+    lr: float,
+    num_epochs: int,
+    device: torch.device,
+    model_kind: str,
+) -> Tuple[torch.nn.Module, dict]:
+    """
+    Generic training loop for torch models (BERT, RNN, LSTM, ModelWithEntropy).
+
+    model_kind:
+        - "bert"              -> AutoModelForSequenceClassification (has .loss)
+        - "rnn" / "lstm"      -> RNNModel / LSTMModel (return logits, we compute CE)
+        - "model_with_entropy"-> ModelWithEntropy (need entropy feature; here we use length as a proxy)
+    """
+    model.to(device)
+    model.train()
     
-    # 获取每个 token 的 log probability
-    with torch.no_grad():
-        outputs = gpt2_model(**inputs, labels=inputs["input_ids"])
-    
-    # 使用负对数损失来估算熵
-    log_probs = -outputs.loss.item() * len(inputs["input_ids"][0])
-    avg_entropy = -log_probs / len(inputs["input_ids"][0])  # 计算平均熵
-    return avg_entropy
+
+    train_loader = _build_dataloader(train_ds, batch_size=batch_size, shuffle=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    history = []
+    last_metrics = {"loss": None, "accuracy": None}
+
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        n_steps = 0
+        correct = 0
+        total = 0
+
+        for batch in tqdm(
+            train_loader,
+            desc=f"Train[{model_kind}] epoch {epoch + 1}/{num_epochs}",
+            leave=False,
+        ):
+            optimizer.zero_grad()
+
+            input_ids, attention_mask, labels = [b.to(device) for b in batch]
+
+            if model_kind == "bert":
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                loss = outputs.loss
+                logits = outputs.logits
+            elif model_kind in {"rnn", "lstm"}:
+                logits = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                loss = criterion(logits, labels)
+            elif model_kind == "model_with_entropy":
+                # Simple entropy proxy: normalized length of the sequence
+                seq_len = attention_mask.sum(dim=1).float() if attention_mask is not None else (
+                    torch.full((input_ids.size(0),), input_ids.size(1), device=device).float()
+                )
+                entropy_feature = (seq_len / seq_len.max()).detach()
+                logits = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    entropy=entropy_feature,
+                )
+                loss = criterion(logits, labels)
+            else:
+                raise ValueError(f"Unsupported model_kind: {model_kind}")
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_steps += 1
+            # accuracy
+            preds = logits.argmax(dim=-1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+        avg_loss = total_loss / max(1, n_steps)
+        acc = correct / max(1, total)
+        last_metrics = {"loss": avg_loss, "accuracy": acc}
+        history.append(last_metrics)
+        print(f"[{model_kind}] Epoch {epoch + 1}/{num_epochs} - train loss: {avg_loss:.4f}, acc: {acc:.4f}")
+
+    return model, {"last_epoch": last_metrics, "history": history}
 
 
+@torch.no_grad()
+def evaluate_torch_model(
+    model: torch.nn.Module,
+    eval_ds: Dataset,
+    batch_size: int,
+    device: torch.device,
+    model_kind: str,
+) -> dict:
+    """
+    Evaluate a torch model on a tokenized Dataset, returning accuracy.
+    """
+    model.to(device)
+    model.eval()
+
+    eval_loader = _build_dataloader(eval_ds, batch_size=batch_size, shuffle=False)
+
+    all_preds: List[int] = []
+    all_labels: List[int] = []
+    total_loss = 0.0
+    n_steps = 0
+    criterion = torch.nn.CrossEntropyLoss()
+
+    for batch in tqdm(
+        eval_loader,
+        desc=f"Eval[{model_kind}]",
+        leave=False,
+    ):
+        input_ids, attention_mask, labels = [b.to(device) for b in batch]
+
+        if model_kind == "bert":
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            logits = outputs.logits
+        elif model_kind in {"rnn", "lstm"}:
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+        elif model_kind == "model_with_entropy":
+            seq_len = attention_mask.sum(dim=1).float() if attention_mask is not None else (
+                torch.full((input_ids.size(0),), input_ids.size(1), device=device).float()
+            )
+            entropy_feature = (seq_len / seq_len.max()).detach()
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                entropy=entropy_feature,
+            )
+        else:
+            raise ValueError(f"Unsupported model_kind: {model_kind}")
+
+        loss = criterion(logits, labels)
+        total_loss += loss.item()
+        n_steps += 1
+
+        probs = torch.softmax(logits, dim=-1)
+        preds = probs.argmax(dim=-1)
+
+        all_preds.extend(preds.cpu().tolist())
+        all_labels.extend(labels.cpu().tolist())
+
+    acc = accuracy_score(all_labels, all_preds)
+    avg_loss = total_loss / max(1, n_steps)
+    print(f"[{model_kind}] Eval loss: {avg_loss:.4f}, accuracy: {acc:.4f}")
+    return {"loss": avg_loss, "accuracy": acc}
 
 
-import torch.nn as nn
-from transformers import AutoModelForSequenceClassification
-
-class ModelWithEntropy(nn.Module):
-    def __init__(self, model, entropy_dim=1):
-        super(ModelWithEntropy, self).__init__()
-        self.bert = model
-        self.fc = nn.Linear(model.config.hidden_size + entropy_dim, 2)  # 拼接特征后进行分类
-    
-    def forward(self, input_ids, attention_mask, entropy):
-        # 获取 BERT 的 embedding
-        outputs = self.bert(input_ids, attention_mask=attention_mask)
-        hidden_state = outputs.last_hidden_state.mean(dim=1)  # 获取 [CLS] token 的向量（可以选择其他聚合方式）
-        
-        # 将 BERT 输出与熵特征拼接
-        combined = torch.cat((hidden_state, entropy.unsqueeze(1)), dim=1)
-        
-        # 分类头
-        logits = self.fc(combined)
-        return logits
-
-
-
-def collate_fn_with_entropy(batch, tokenizer, gpt2_model):
-    texts = [example['text'] for example in batch]
-    labels = torch.tensor([example['label'] for example in batch])
-    
-    # 计算每个文本的熵特征
-    entropies = torch.tensor([compute_entropy(text, gpt2_model, tokenizer) for text in texts])
-    
-    # 使用tokenizer处理文本
-    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
-    
-    return {
-        'input_ids': inputs['input_ids'],
-        'attention_mask': inputs['attention_mask'],
-        'entropy': entropies,
-        'labels': labels
-    }
-
-
-
-from transformers import Trainer, TrainingArguments
-
-def train_model(model, train_dataset, eval_dataset, tokenizer, gpt2_model, output_dir="./results"):
-    # 设置训练参数
-    args = TrainingArguments(
-        output_dir=output_dir,              # 保存结果的目录
-        evaluation_strategy="epoch",        # 每一轮后评估
-        learning_rate=2e-5,                 # 学习率
-        per_device_train_batch_size=16,     # 每个设备的批量大小
-        num_train_epochs=3,                 # 训练周期
-        weight_decay=0.01                   # 权重衰减
+def train_eval_tfidf(
+    texts: List[str],
+    labels: List[int],
+    test_size: float = 0.2,
+    seed: int = 42,
+    num_epochs: int = 10,
+    batch_size: int = 128,
+    lr: float = 1e-2,
+    device: torch.device = torch.device("cpu"),
+) -> Tuple[TfidfLRDetector, dict]:
+    """
+    Train and evaluate TF-IDF + Logistic Regression baseline.
+    Returns accuracy on the test split.
+    """
+    X_train, X_test, y_train, y_test = train_test_split(
+        texts, labels, test_size=test_size, random_state=seed, stratify=labels
     )
-    
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        data_collator=lambda batch: collate_fn_with_entropy(batch, tokenizer, gpt2_model)
+
+    model = TfidfLRDetector(device=device)
+    model.fit(X_train, y_train, num_epochs=num_epochs, batch_size=batch_size, lr=lr)
+    probs = model.predict_proba(X_test)
+    preds = np.argmax(probs, axis=1)
+    acc = accuracy_score(y_test, preds)
+    print(f"[tfidf_lr] Eval accuracy: {acc:.4f}")
+    return model, {"accuracy": acc}
+
+
+def train_eval_gpt2_entropy(
+    texts: List[str],
+    labels: List[int],
+    test_size: float = 0.2,
+    seed: int = 42,
+) -> Tuple[GPT2EntropyDetector, dict]:
+    """
+    Train and evaluate GPT-2 entropy-based detector.
+    Returns accuracy on the test split.
+    """
+    X_train, X_test, y_train, y_test = train_test_split(
+        texts, labels, test_size=test_size, random_state=seed, stratify=labels
     )
 
-    # 开始训练
-    trainer.train()
+    det = GPT2EntropyDetector()
+    det.fit(X_train, y_train)
+    probs = det.predict_proba(X_test)
+    preds = np.argmax(probs, axis=1)
+    acc = accuracy_score(y_test, preds)
+    print(f"[gpt2_entropy] Eval accuracy: {acc:.4f}")
+    return det, {"accuracy": acc}
+
+
+def train_eval_gpt2_ppl(
+    texts: List[str],
+    labels: List[int],
+    test_size: float = 0.2,
+    seed: int = 42,
+) -> Tuple[GPT2PerplexityDetector, dict]:
+    """
+    Train and evaluate GPT-2 perplexity-based detector (no entropy features).
+    Returns accuracy on the test split.
+    """
+    X_train, X_test, y_train, y_test = train_test_split(
+        texts, labels, test_size=test_size, random_state=seed, stratify=labels
+    )
+
+    det = GPT2PerplexityDetector()
+    det.fit(X_train, y_train)
+    probs = det.predict_proba(X_test)
+    preds = np.argmax(probs, axis=1)
+    acc = accuracy_score(y_test, preds)
+    print(f"[gpt2_ppl] Eval accuracy: {acc:.4f}")
+    return det, {"accuracy": acc}
