@@ -43,7 +43,7 @@ def get_args():
 
 def load_and_preprocess_data(
     dataset_name: str = "Hello-SimpleAI/HC3",
-    split: str = "train",          # 对 top2 有 train/test；对 HC3 我们再处理
+    split: str = "train",         
     max_length: int = 256,
 ) -> Tuple[Dataset, AutoTokenizer]:
     """
@@ -53,19 +53,19 @@ def load_and_preprocess_data(
     and tokenize into model inputs with labels.
 
     返回:
-      tokenized_ds: HuggingFace Dataset，包含 input_ids, attention_mask, labels
+      tokenized_ds: HuggingFace Dataset,input_ids, attention_mask, labels
       tokenizer: AutoTokenizer
     """
 
-    # --------- 1. 载入原始数据 ---------
+   
     requested_split = split
 
-    # 为了兼容，你以后要扩展别的 dataset 也容易
+   
     if dataset_name == "Hello-SimpleAI/HC3":
-        # HC3 是 script-based dataset，datasets>=3 会有报错，这里保留你原本的异常处理逻辑
+       
         hc3_common_splits = {"all", "wiki_csai", "finance", "medicine", "dev"}
         try:
-            # name=config 是它的子配置（如 open_qa, medicine 等）
+            
             config = requested_split if requested_split in hc3_common_splits else "all"
             ds = load_dataset(dataset_name, name=config)
         except Exception as e:
@@ -77,9 +77,9 @@ def load_and_preprocess_data(
                 ) from e
             raise
 
-        # HC3 返回的是 DatasetDict
+       
         if isinstance(ds, dict):
-            # 尝试用用户指定 split；如果没有，就默认用 'train'，再不行就拿第一个
+           
             if requested_split in ds:
                 dataset = ds[requested_split]
             elif "train" in ds:
@@ -90,10 +90,6 @@ def load_and_preprocess_data(
         else:
             dataset = ds
 
-        # --------- 2.1 HC3: 构造 text + label ---------
-        # 思路：每条 question 生成多条样本：
-        #   - question + 每个 human_answer -> label = 0
-        #   - question + 每个 chatgpt_answer -> label = 1
         def build_hc3_text_and_label(batch):
             texts = []
             labels = []
@@ -126,45 +122,42 @@ def load_and_preprocess_data(
         dataset = dataset.map(
             build_hc3_text_and_label,
             batched=True,
-            remove_columns=dataset.column_names,  # 把原始列全部替换掉
+            remove_columns=dataset.column_names,  
         )
 
     elif dataset_name == "andythetechnerd03/AI-human-text":
-        # --------- top2: Koala-like AI-human text dataset ---------
-        # 这个数据集已经有:
-        #   - text: 文本
-        #   - generated: 0 / 1 (0=human, 1=LLM)
+
         ds = load_dataset(dataset_name)
 
-        # DatasetDict -> 选 split
+     
         if isinstance(ds, dict):
             if requested_split in ds:
                 dataset = ds[requested_split]
             else:
-                # 默认用 'train'
+          
                 dataset = ds.get("train", next(iter(ds.values())))
         else:
             dataset = ds
 
-        # 统一成 label 列
+
         if "generated" in dataset.column_names and "label" not in dataset.column_names:
             dataset = dataset.rename_column("generated", "label")
 
-        # 确保有 text / label
+ 
         assert "text" in dataset.column_names, f"{dataset_name} must have a 'text' column."
         assert "label" in dataset.column_names, f"{dataset_name} must have a 'label' or 'generated' column."
 
     else:
-        # 你以后扩展别的 dataset 可以在这里加分支
+
         raise ValueError(
             f"Unsupported dataset_name={dataset_name}. "
             "Currently only support 'Hello-SimpleAI/HC3' and 'andythetechnerd03/AI-human-text'."
         )
 
-    # --------- 3. Tokenizer ---------
+
     tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 
-    # --------- 4. Tokenization (加上 labels) ---------
+
     def preprocess(examples):
         enc = tokenizer(
             examples["text"],
@@ -172,7 +165,7 @@ def load_and_preprocess_data(
             padding="max_length",
             max_length=max_length,
         )
-        # 把 label 一并带进去，方便直接喂给 AutoModelForSequenceClassification
+  
         enc["labels"] = examples["label"]
         return enc
 

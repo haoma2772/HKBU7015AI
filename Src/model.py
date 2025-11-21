@@ -13,10 +13,6 @@ from transformers import (
 )
 
 
-# ------------------------------
-# 1. Traditional ML: TF-IDF + Logistic Regression
-# ------------------------------
-
 
 class TfidfLRDetector:
     """
@@ -49,12 +45,12 @@ class TfidfLRDetector:
         batch_size: int = 128,
         lr: float = 1e-2,
     ):
-        # 1. TF-IDF features (CPU, sparse)
+       
         X_sparse = self.vectorizer.fit_transform(texts)
         X = torch.tensor(X_sparse.toarray(), dtype=torch.float32, device=self.device)
         y = torch.tensor(labels, dtype=torch.long, device=self.device)
 
-        # 2. Simple linear classifier
+        
         num_features = X.size(1)
         self.model = nn.Linear(num_features, 2).to(self.device)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
@@ -96,9 +92,7 @@ class TfidfLRDetector:
         return (probs[:, 1] >= threshold).astype(int)
 
 
-# ------------------------------
-# 2. Neural models: RNN / LSTM
-# ------------------------------
+
 
 
 class RNNModel(nn.Module):
@@ -219,11 +213,6 @@ class LSTMModel(nn.Module):
         return logits
 
 
-# ------------------------------
-# 3. BERT + Entropy model
-# ------------------------------
-
-
 class ModelWithEntropy(nn.Module):
     """
     BERT encoder + extra entropy feature(s), followed by a linear classifier.
@@ -259,9 +248,7 @@ class ModelWithEntropy(nn.Module):
         return logits
 
 
-# ------------------------------
-# 4. GPT-2 entropy-based detector
-# ------------------------------
+
 
 
 class GPT2EntropyDetector:
@@ -372,9 +359,6 @@ class GPT2PerplexityDetector:
         return (probs[:, 1] >= threshold).astype(int)
 
 
-# -----------------------------
-# 5. Factory to get model
-# -----------------------------
 
 
 def get_model(

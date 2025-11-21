@@ -36,21 +36,17 @@ We implement an **LLM output detector** that predicts whether a text was written
     - `LSTMModel` – bidirectional LSTM + linear classification head.
 
   - Transformer / entropy-based models
-    - `ModelWithEntropy` – BERT encoder (`AutoModel`), concatenated with an entropy feature vector, then a linear layer for 2-class classification.
-    - `GPT2EntropyDetector` – uses GPT‑2 to compute average token entropy and sequence length, then trains a Logistic Regression classifier on these features.
-    - `GPT2PerplexityDetector` – uses GPT‑2 perplexity (no entropy) and length as features for Logistic Regression (for ablation).
+    - `DistilBERT` 
+    - `DistilBERT+Entropy` 
 
   - Model factory
     - `get_model(model_type=..., ...)` supports:
       - `tfidf_lr`
-      - `distilbert-base-uncased`
-      - `bert-base-uncased`
-      - `roberta-base`
       - `rnn`
       - `lstm`
-      - `model_with_entropy`
-      - `gpt2_entropy`
-      - `gpt2_ppl`
+      - `distilbert-base-uncased`
+      - `DistilBERT+Entropy`
+
 
 - `Src/help.py`  
   Shared training and evaluation utilities:
@@ -61,7 +57,7 @@ We implement an **LLM output detector** that predicts whether a text was written
 
   - Generic training / evaluation for torch models
     - `train_torch_model(model, train_ds, batch_size, lr, num_epochs, device, model_kind)`:
-      - `model_kind` in `{"bert", "rnn", "lstm", "model_with_entropy"}`.
+      - `model_kind` in `{"tfidf_lr, bert", "rnn", "lstm", "model_with_entropy"}`.
       - Uses `AdamW + CrossEntropyLoss` for multiple epochs.
       - Uses `tqdm` to display training progress.
       - Returns:
@@ -81,12 +77,7 @@ We implement an **LLM output detector** that predicts whether a text was written
       - Train/test split on raw `texts` and `labels`,
       - trains `TfidfLRDetector`,
       - returns final accuracy.
-    - `train_eval_gpt2_entropy(texts, labels, ...) -> (model, metrics)`:
-      - Similar pipeline for `GPT2EntropyDetector`,
-      - returns final accuracy.
-    - `train_eval_gpt2_ppl(texts, labels, ...) -> (model, metrics)`:
-      - Pipeline for `GPT2PerplexityDetector` (no entropy),
-      - returns final accuracy.
+
 
 
 ## 2. Installation
@@ -142,13 +133,11 @@ Key arguments (see `Src/utils.py:get_args`):
 
 - `--method`  
   - Which method to run:
-    - `tfidf_lr` – TF‑IDF + linear classifier (GPU-first for the classifier).
-    - `bert` – DistilBERT classifier (`distilbert-base-uncased`, without entropy).
+    - `tfidf_lr` – TF‑IDF + linear classifier 
     - `rnn` – RNN classifier.
     - `lstm` – LSTM classifier.
-    - `model_with_entropy` – BERT encoder + entropy feature (BERT + entropy ablation).
-    - `gpt2_entropy` – GPT‑2 entropy features + Logistic Regression.
-    - `gpt2_ppl` – GPT‑2 perplexity + length features (no entropy, for ablation).
+    - `bert` – DistilBERT classifier 
+    - `bert+entropy` – DistilBERT + entropy classifier 
 
 Example commands:
 
@@ -189,10 +178,8 @@ Trained models are saved under the `models/` directory:
 - `models/bert_model.pt`
 - `models/rnn_model.pt`
 - `models/lstm_model.pt`
-- `models/model_with_entropy.pt`
 - `models/tfidf_lr_model.joblib`
-- `models/gpt2_entropy_model.joblib`
-- `models/gpt2_ppl_model.joblib`
+
 
 Notes:
 
@@ -224,9 +211,7 @@ Below are concrete experiment setups for your report.
   - `bert` (BERT without entropy)
   - `rnn`
   - `lstm`
-  - `model_with_entropy` (BERT + entropy)
-  - `gpt2_entropy` (GPT‑2 + entropy)
-  - `gpt2_ppl` (GPT‑2 without entropy, perplexity-based)
+
 
 - Report:
   - Accuracy (and optionally precision / recall / F1) on the same test split.
@@ -240,9 +225,8 @@ Example table:
 | DistilBERT           |          |                  |
 | RNN                  |          |                  |
 | LSTM                 |          |                  |
-| DistilBERT + Entropy |          |                  |
-| GPT-2 + Entropy      |          |                  |
-| GPT-2 (Perplexity)   |          |                  |
+|DistilBERT+Entropy                  |          |                  |
+
 
 
 ### 5.2 Effect of Max Sequence Length (`max_length`)
@@ -277,7 +261,7 @@ Example table:
 - For selected models (e.g. `bert`, `lstm`, `model_with_entropy`), run a small grid:
   - `num_epochs ∈ {10, 30, 50}`
   - `learning_rate ∈ {1e-3, 1e-4, 1e-5}`  
-  - (Optional) also include `gpt2_entropy` vs. `gpt2_ppl` to see whether entropy helps convergence.
+
 
 - For each combination, record:
   - Training loss per epoch (from `train_torch_model`).
@@ -286,62 +270,4 @@ Example table:
 - Report:
   - Accuracy vs. epochs and vs. learning rate.
   - Signs of underfitting (all curves low) vs. overfitting (train accuracy increases while eval accuracy drops).
-
-
-### 5.4 Entropy Ablation Study (BERT & GPT-2)
-
-**Goal:** explicitly test whether entropy features improve detection performance.**
-
-#### 5.4.1 BERT with vs. without entropy
-
-- Dataset: choose one (e.g. `Hello-SimpleAI/HC3` with `--split wiki_csai`).  
-- Settings:
-  - `max_length = 256`
-  - `batch_size = 256`
-  - `num_epochs = 30`
-  - `learning_rate = 1e-4`
-
-- Models:
-  - `bert` – DistilBERT classifier (no entropy).
-  - `model_with_entropy` – DistilBERT encoder + entropy feature.
-
-- Report:
-  - Accuracy of `bert` vs. `model_with_entropy` on the same test split.
-  - If `model_with_entropy` consistently outperforms `bert`, this demonstrates that adding entropy to BERT is effective.
-
-Example table:
-
-| Model               | Uses Entropy | Accuracy |
-|---------------------|--------------|----------|
-| DistilBERT          | No           |          |
-| DistilBERT +Entropy | Yes          |          |
-
-
-#### 5.4.2 GPT‑2 with vs. without entropy
-
-- Dataset: e.g. `andythetechnerd03/AI-human-text`.  
-- Settings:
-  - Use the same train/test split and number of samples.
-
-- Models:
-  - `gpt2_ppl` – GPT‑2 perplexity + length (no explicit entropy feature).
-  - `gpt2_entropy` – GPT‑2 entropy + length (current entropy-based detector).
-
-- Report:
-  - Accuracy of `gpt2_ppl` vs. `gpt2_entropy` on the same test set.
-  - If `gpt2_entropy` > `gpt2_ppl`, it indicates that entropy is a useful feature beyond simple perplexity.
-
-Example table:
-
-| Model             | Features              | Accuracy |
-|-------------------|-----------------------|----------|
-| GPT‑2 Perplexity  | [perplexity, length]  |          |
-| GPT‑2 Entropy     | [entropy, length]     |          |
-
-
-
-## need to do
-1. pre + slides
-2. debug+run exp + plot figure/table
-3. report
 
